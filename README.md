@@ -10,8 +10,8 @@ Transform Minecraft villagers into intelligent AI agents with personalities, mem
 - **📝 Memory System**: Villagers remember the last 50 events and 20 conversations
 - **🎯 Goal System**: Villagers autonomously generate and pursue goals (gather, craft, trade, socialize)
 - **🎒 Custom Inventory**: Each villager has a 27-slot inventory to store items
-- **🤝 Relationship Tracking**: Villagers track relationships with other villagers (-100 to +100)
-- **💬 Player Interaction**: Sneak + right-click to talk to villagers
+- **💰 Dynamic Trading**: LLM-based price negotiation and persuasion
+- **💬 Player Interaction**: Right-click to talk to villagers
 - **🧠 LLM Integration**: OpenAI and Anthropic API support for intelligent responses
 - **⚙️ Full Configuration**: Customize all aspects via config file
 
@@ -19,13 +19,12 @@ Transform Minecraft villagers into intelligent AI agents with personalities, mem
 
 - **🌾 World Interaction**: Farming, harvesting, crafting, building
 - **💬 Villager-to-Villager Chat**: AI-powered conversations between villagers
-- **💰 Dynamic Trading**: LLM-based price negotiation and persuasion
 - **🎨 Custom Chat GUI**: Beautiful interface for player-villager conversations
 - **🏰 Village Coordination**: Villagers work together on tasks
 
 ## 📦 Installation
 
-1. Download the mod JAR file
+1. Download source code and compile, or wait for jar release
 2. Place it in your Minecraft `mods` folder
 3. Launch Minecraft with Forge 36.2.42 (Minecraft 1.16.5)
 4. Configure your LLM API key (see Configuration below)
@@ -91,9 +90,9 @@ After first launch, edit `config/villageragent-common.toml`:
 ### Talking to Villagers
 
 1. Find a villager in the world
-2. **Sneak + Right-Click** on the villager
+2. **Right-Click** on the villager
 3. The villager will greet you with their personality
-4. (Full chat GUI coming soon!)
+4. (Better GUI coming soon!)
 
 ### Observing AI Behavior
 
@@ -111,24 +110,6 @@ After first launch, edit `config/villageragent-common.toml`:
 [VillagerAgent] Beatrice: New memory - Talked with player Steve
 ```
 
-## 🏗️ Architecture
-
-```
-src/main/java/com/gitlab/AaronAA0721/villageragent/
-├── Villageragent.java              # Main mod class
-├── ai/
-│   ├── VillagerAgentData.java      # AI agent data structure
-│   ├── AgentGoal.java              # Goal system
-│   ├── AgentInventory.java         # Custom inventory
-│   ├── VillagerAgentManager.java   # Central AI controller
-│   └── LLMService.java             # LLM API integration
-├── config/
-│   └── ModConfig.java              # Configuration system
-└── events/
-    └── VillagerEventHandler.java   # Event handling
-```
-
-## 🛠️ Development
 
 ### Building from Source
 
@@ -159,11 +140,11 @@ gradle build
 - [x] Custom inventory
 - [x] LLM integration (OpenAI/Anthropic)
 - [x] Basic player interaction
+- [x] Dynamic trading system
 - [ ] Advanced LLM-based goal generation
 - [ ] Custom chat GUI
 - [ ] World interaction (farming, crafting)
 - [ ] Villager-to-villager communication
-- [ ] Dynamic trading system
 - [ ] Pathfinding and navigation
 - [ ] Village coordination
 
@@ -171,9 +152,6 @@ gradle build
 
 Contributions are welcome! Please feel free to submit pull requests.
 
-## 📄 License
-
-All Rights Reserved
 
 ## 🙏 Acknowledgments
 
