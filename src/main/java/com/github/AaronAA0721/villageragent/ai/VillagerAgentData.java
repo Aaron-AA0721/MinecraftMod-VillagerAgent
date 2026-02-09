@@ -35,6 +35,7 @@ public class VillagerAgentData {
     private boolean llmGenerationFailed = false;
     private String llmErrorMessage = null;
     private long lastRestockTime = 0;  // Track when villager last restocked at job block
+    private int farmingStateTicksRemaining = 0;  // >0 means the villager is actively farming an area
 
     public VillagerAgentData(UUID villagerId) {
         this.villagerId = villagerId;
@@ -248,6 +249,10 @@ public class VillagerAgentData {
     public String getLLMErrorMessage() { return llmErrorMessage; }
     public long getLastRestockTime() { return lastRestockTime; }
     public void setLastRestockTime(long time) { this.lastRestockTime = time; }
+    public int getFarmingStateTicksRemaining() { return farmingStateTicksRemaining; }
+    public void setFarmingStateTicksRemaining(int ticks) { this.farmingStateTicksRemaining = ticks; }
+    public boolean isInFarmingState() { return farmingStateTicksRemaining > 0; }
+    public void tickFarmingState() { if (farmingStateTicksRemaining > 0) farmingStateTicksRemaining--; }
     
     public void addMemory(String memory) {
         memories.add(memory);

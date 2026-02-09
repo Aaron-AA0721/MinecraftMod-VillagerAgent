@@ -70,8 +70,8 @@ public class ModConfig {
                 .define("enable_world_interaction", true);
 
         ENABLE_AUTO_PICKUP = BUILDER
-                .comment("Enable villagers to automatically pick up nearby items (experimental)")
-                .define("enable_auto_pickup", false);
+                .comment("Enable villagers to automatically pick up nearby items")
+                .define("enable_auto_pickup", true);
 
         VILLAGER_PICKUP_INTERVAL = BUILDER
                 .comment("Ticks between villager item pickup attempts (20 ticks = 1 second)")

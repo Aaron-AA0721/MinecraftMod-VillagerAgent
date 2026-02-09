@@ -18,6 +18,21 @@ import java.util.concurrent.ConcurrentHashMap;
  * Manages all AI villager agents in the world
  */
 public class VillagerAgentManager {
+    private static final Random RANDOM = new Random();
+
+    /**
+     * Chance per tick that the villager decides to act on something it sees.
+     * 0.3 = ~30% each tick → on average it takes ~3 ticks (~0.15 s) to decide.
+     */
+    private static final double FARMING_ACTION_CHANCE = 0.3;
+
+    /**
+     * How long (in ticks) the villager stays in "farming mode" once it decides
+     * to start working. 200 ticks ≈ 10 seconds, 300 ≈ 15 seconds.
+     * A small random range is added so villagers don't all stop at the same time.
+     */
+    private static final int FARMING_STATE_MIN_TICKS = 200;
+    private static final int FARMING_STATE_MAX_TICKS = 400;
     private static final Logger LOGGER = LogManager.getLogger();
     private static final Map<UUID, VillagerAgentData> agents = new ConcurrentHashMap<>();
     
@@ -88,12 +103,227 @@ public class VillagerAgentManager {
         // Check if villager is at their job block for restocking
         checkJobBlockRestock(villager, agent);
 
+        // For farmers: automatically perform farming actions based on surroundings
+        if (world instanceof ServerWorld) {
+            performProfessionActions(villager, (ServerWorld) world, agent);
+        }
+
         // Process current goals
         processGoals(villager, agent);
 
         // Decide on new actions based on AI
         if (agent.getGoals().isEmpty() || shouldGenerateNewGoals(agent)) {
             generateNewGoals(villager, agent);
+        }
+    }
+
+    /**
+     * Perform automatic profession-based actions.
+     * Farmers will harvest mature crops and plant seeds when near farmland.
+     */
+    private static void performProfessionActions(VillagerEntity villager, ServerWorld world, VillagerAgentData agent) {
+        if (!ModConfig.ENABLE_WORLD_INTERACTION.get()) return;
+
+        String profession = agent.getProfession();
+        if (profession == null) return;
+
+        switch (profession.toLowerCase()) {
+            case "farmer":
+                performFarmerActions(villager, world, agent);
+                break;
+            // Future professions can be added here
+        }
+    }
+
+    /**
+     * Farmer-specific automatic actions using walk-then-act pattern.
+     *
+     * Two phases:
+     * 1. **Noticing** — the villager is idle. Each tick it has a random chance to
+     *    glance at the blocks in its forward cone. If it spots work, it enters
+     *    "farming state" for a duration and immediately starts the first action.
+     * 2. **Farming state** — the villager is committed to working the area. It
+     *    scans 360° without any random roll, continuously picking the next closest
+     *    block to harvest or plant. The state expires after a timer or when there
+     *    is nothing left to do nearby.
+     */
+    private static void performFarmerActions(VillagerEntity villager, ServerWorld world, VillagerAgentData agent) {
+        VillagerAction current = agent.getCurrentAction();
+
+        // If we already have an active walk-to-block action, continue it
+        if (current != null && isFarmingAction(current)) {
+            continueFarmingAction(villager, world, agent, current);
+            return;
+        }
+
+        // --- Already in farming state: scan 360° for the next block to work ---
+        if (agent.isInFarmingState()) {
+            agent.tickFarmingState();
+
+            BlockPos villagerPos = villager.blockPosition();
+
+            // Priority 1: harvest
+            BlockPos cropTarget = FarmingAction.findNearestMatureCrop(world, villagerPos);
+            if (cropTarget != null) {
+                startFarmingAction(villager, agent, VillagerAction.ActionType.HARVEST,
+                        "Harvesting area", cropTarget);
+                return;
+            }
+
+            // Priority 2: plant
+            if (FarmingAction.hasSeeds(agent)) {
+                BlockPos farmlandTarget = FarmingAction.findNearestEmptyFarmland(world, villagerPos);
+                if (farmlandTarget != null) {
+                    startFarmingAction(villager, agent, VillagerAction.ActionType.GROW,
+                            "Planting area", farmlandTarget);
+                    return;
+                }
+            }
+
+            // Nothing left to do — exit farming state early
+            agent.setFarmingStateTicksRemaining(0);
+            agent.setCurrentActivity("idle");
+            LOGGER.debug(agent.getName() + " finished farming — nothing left nearby");
+            return;
+        }
+
+        // --- Not in farming state: random chance + forward cone to notice work ---
+        if (RANDOM.nextDouble() > FARMING_ACTION_CHANCE) {
+            return; // Not looking this tick
+        }
+
+        BlockPos villagerPos = villager.blockPosition();
+        float headYaw = villager.yHeadRot;
+
+        // Check forward cone for anything to do
+        BlockPos cropTarget = FarmingAction.findNearestMatureCrop(world, villagerPos, headYaw);
+        if (cropTarget != null) {
+            enterFarmingState(agent);
+            startFarmingAction(villager, agent, VillagerAction.ActionType.HARVEST,
+                    "Noticed crops — starting harvest", cropTarget);
+            return;
+        }
+
+        if (FarmingAction.hasSeeds(agent)) {
+            BlockPos farmlandTarget = FarmingAction.findNearestEmptyFarmland(world, villagerPos, headYaw);
+            if (farmlandTarget != null) {
+                enterFarmingState(agent);
+                startFarmingAction(villager, agent, VillagerAction.ActionType.GROW,
+                        "Noticed farmland — starting planting", farmlandTarget);
+                return;
+            }
+        }
+    }
+
+    /**
+     * Put the villager into farming state for a random duration.
+     */
+    private static void enterFarmingState(VillagerAgentData agent) {
+        int duration = FARMING_STATE_MIN_TICKS
+                + RANDOM.nextInt(FARMING_STATE_MAX_TICKS - FARMING_STATE_MIN_TICKS + 1);
+        agent.setFarmingStateTicksRemaining(duration);
+        agent.setCurrentActivity("farming");
+        LOGGER.debug(agent.getName() + " entered farming state for " + duration + " ticks");
+    }
+
+    private static boolean isFarmingAction(VillagerAction action) {
+        return action.getActionType() == VillagerAction.ActionType.HARVEST
+            || action.getActionType() == VillagerAction.ActionType.GROW;
+    }
+
+    /**
+     * Create a new farming action, set the target block, and start walking.
+     */
+    private static void startFarmingAction(VillagerEntity villager, VillagerAgentData agent,
+                                            VillagerAction.ActionType type, String desc, BlockPos target) {
+        VillagerAction action = new VillagerAction(type, desc);
+        action.setTargetBlockPos(target);
+        action.setPhase(VillagerAction.ActionPhase.WALKING);
+        agent.setCurrentAction(action);
+
+        // Keep "farming" as the activity while in farming state
+        if (!agent.isInFarmingState()) {
+            agent.setCurrentActivity(type == VillagerAction.ActionType.HARVEST ? "harvesting" : "planting");
+        }
+
+        // Tell the villager to walk toward the target block
+        villager.getNavigation().moveTo(
+                target.getX() + 0.5, target.getY(), target.getZ() + 0.5, 0.6);
+
+        LOGGER.debug(agent.getName() + " [" + desc + "] — walking to " + target);
+    }
+
+    /**
+     * Continue an in-progress farming action: check distance, act or keep walking.
+     */
+    private static void continueFarmingAction(VillagerEntity villager, ServerWorld world,
+                                               VillagerAgentData agent, VillagerAction action) {
+        BlockPos target = action.getTargetBlockPos();
+        if (target == null) {
+            // Shouldn't happen, but clear the action
+            agent.setCurrentAction(null);
+            return;
+        }
+
+        BlockPos villagerPos = villager.blockPosition();
+        double distSq = villagerPos.distSqr(target);
+
+        // Check if we've arrived (within 2 blocks)
+        if (distSq <= FarmingAction.INTERACT_RANGE_SQ) {
+            action.setPhase(VillagerAction.ActionPhase.ACTING);
+            performFarmingActionAtBlock(villager, world, agent, action, target);
+            // Action done — clear it so next tick we scan for a new target
+            agent.setCurrentAction(null);
+            return;
+        }
+
+        // Still walking — check if stuck
+        action.incrementStuckTicks();
+        if (action.getStuckTicks() > FarmingAction.STUCK_TIMEOUT_TICKS) {
+            LOGGER.debug(agent.getName() + " gave up reaching " + target + " (stuck)");
+            agent.setCurrentAction(null);
+            // Don't exit farming state — next tick will pick a different block
+            if (!agent.isInFarmingState()) {
+                agent.setCurrentActivity("idle");
+            }
+            return;
+        }
+
+        // Re-issue navigation command periodically (every 20 ticks) in case path was interrupted
+        if (action.getStuckTicks() % 20 == 0) {
+            villager.getNavigation().moveTo(
+                    target.getX() + 0.5, target.getY(), target.getZ() + 0.5, 0.6);
+        }
+    }
+
+    /**
+     * The villager has arrived at the target block — perform the actual action.
+     */
+    private static void performFarmingActionAtBlock(VillagerEntity villager, ServerWorld world,
+                                                     VillagerAgentData agent, VillagerAction action,
+                                                     BlockPos target) {
+        switch (action.getActionType()) {
+            case HARVEST:
+                // Verify the crop is still there and mature
+                if (FarmingAction.isMatureCrop(world, target)) {
+                    FarmingAction.harvestBlockAt(villager, world, agent, target);
+                    // After harvesting, try to replant immediately if we have seeds
+                    if (FarmingAction.isEmptyFarmland(world, target.below())) {
+                        FarmingAction.plantSeedAt(villager, world, agent, target.below());
+                    }
+                } else {
+                    LOGGER.debug(agent.getName() + " arrived but crop at " + target + " is gone");
+                }
+                break;
+            case GROW:
+                if (FarmingAction.isEmptyFarmland(world, target)) {
+                    FarmingAction.plantSeedAt(villager, world, agent, target);
+                } else {
+                    LOGGER.debug(agent.getName() + " arrived but farmland at " + target + " is occupied");
+                }
+                break;
+            default:
+                break;
         }
     }
 
@@ -180,9 +410,9 @@ public class VillagerAgentManager {
     }
     
     private static void executeGatherGoal(VillagerEntity villager, VillagerAgentData agent, AgentGoal goal) {
-        // TODO: Implementation for gathering resources
-        // This will be expanded in the world interaction system
-        agent.addMemory("Tried to gather " + goal.getTargetItem());
+        // For farmer villagers gathering crops, the farming walk-then-act system
+        // handles this automatically via performFarmerActions. Just log intent.
+        agent.addMemory("Trying to gather " + goal.getTargetItem());
     }
     
     private static void executeCraftGoal(VillagerEntity villager, VillagerAgentData agent, AgentGoal goal) {
