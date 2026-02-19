@@ -135,56 +135,46 @@ public class FarmingAction {
 
     // ---------------------------------------------------------------
     //  Full 360° scans (used when already in farming state)
+    //  Returns candidates sorted by distance so the caller can
+    //  iterate and pick the first one that is path-reachable.
     // ---------------------------------------------------------------
 
     /**
-     * Find the nearest mature crop in any direction (full 360°).
-     * Used when the villager is already committed to farming an area.
+     * Find all mature crops in any direction (full 360°), sorted nearest-first.
      */
-    public static BlockPos findNearestMatureCrop(ServerWorld world, BlockPos center) {
-        BlockPos best = null;
-        double bestDistSq = Double.MAX_VALUE;
-
+    public static List<BlockPos> findMatureCropsSorted(ServerWorld world, BlockPos center) {
+        List<BlockPos> results = new ArrayList<>();
         for (int x = -SCAN_RADIUS; x <= SCAN_RADIUS; x++) {
             for (int y = -SCAN_HEIGHT; y <= SCAN_HEIGHT; y++) {
                 for (int z = -SCAN_RADIUS; z <= SCAN_RADIUS; z++) {
                     BlockPos pos = center.offset(x, y, z);
                     if (isMatureCrop(world, pos)) {
-                        double distSq = pos.distSqr(center);
-                        if (distSq < bestDistSq) {
-                            bestDistSq = distSq;
-                            best = pos;
-                        }
+                        results.add(pos.immutable());
                     }
                 }
             }
         }
-        return best;
+        results.sort(Comparator.comparingDouble(p -> p.distSqr(center)));
+        return results;
     }
 
     /**
-     * Find the nearest empty farmland in any direction (full 360°).
-     * Used when the villager is already committed to farming an area.
+     * Find all empty farmland in any direction (full 360°), sorted nearest-first.
      */
-    public static BlockPos findNearestEmptyFarmland(ServerWorld world, BlockPos center) {
-        BlockPos best = null;
-        double bestDistSq = Double.MAX_VALUE;
-
+    public static List<BlockPos> findEmptyFarmlandSorted(ServerWorld world, BlockPos center) {
+        List<BlockPos> results = new ArrayList<>();
         for (int x = -SCAN_RADIUS; x <= SCAN_RADIUS; x++) {
             for (int y = -SCAN_HEIGHT; y <= SCAN_HEIGHT; y++) {
                 for (int z = -SCAN_RADIUS; z <= SCAN_RADIUS; z++) {
                     BlockPos pos = center.offset(x, y, z);
                     if (isEmptyFarmland(world, pos)) {
-                        double distSq = pos.distSqr(center);
-                        if (distSq < bestDistSq) {
-                            bestDistSq = distSq;
-                            best = pos;
-                        }
+                        results.add(pos.immutable());
                     }
                 }
             }
         }
-        return best;
+        results.sort(Comparator.comparingDouble(p -> p.distSqr(center)));
+        return results;
     }
 
     // ---------------------------------------------------------------

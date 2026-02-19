@@ -4,6 +4,7 @@ import com.github.AaronAA0721.villageragent.config.ModConfig;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.ai.brain.memory.MemoryModuleType;
 import net.minecraft.entity.merchant.villager.VillagerEntity;
+import net.minecraft.pathfinding.Path;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.GlobalPos;
 import net.minecraft.world.World;
@@ -21,18 +22,17 @@ public class VillagerAgentManager {
     private static final Random RANDOM = new Random();
 
     /**
-     * Chance per tick that the villager decides to act on something it sees.
-     * 0.3 = ~30% each tick → on average it takes ~3 ticks (~0.15 s) to decide.
+     * Chance per tick that an idle villager glances around for farming work.
+     * 1/200 = 0.005 → on average once every 200 ticks ≈ 10 seconds.
      */
-    private static final double FARMING_ACTION_CHANCE = 0.3;
+    private static final double FARMING_SCAN_CHANCE = 0.005;
 
     /**
-     * How long (in ticks) the villager stays in "farming mode" once it decides
-     * to start working. 200 ticks ≈ 10 seconds, 300 ≈ 15 seconds.
-     * A small random range is added so villagers don't all stop at the same time.
+     * Cooldown (in ticks) after the villager finishes a farming session before
+     * it starts scanning for new work again.  200-400 ticks ≈ 10-20 seconds.
      */
-    private static final int FARMING_STATE_MIN_TICKS = 200;
-    private static final int FARMING_STATE_MAX_TICKS = 400;
+    private static final int FARMING_COOLDOWN_MIN_TICKS = 200;
+    private static final int FARMING_COOLDOWN_MAX_TICKS = 400;
     private static final Logger LOGGER = LogManager.getLogger();
     private static final Map<UUID, VillagerAgentData> agents = new ConcurrentHashMap<>();
     
@@ -136,43 +136,48 @@ public class VillagerAgentManager {
     }
 
     /**
-     * Farmer-specific automatic actions using walk-then-act pattern.
+     * Farmer-specific automatic actions — state machine per tick.
      *
-     * Two phases:
-     * 1. **Noticing** — the villager is idle. Each tick it has a random chance to
-     *    glance at the blocks in its forward cone. If it spots work, it enters
-     *    "farming state" for a duration and immediately starts the first action.
-     * 2. **Farming state** — the villager is committed to working the area. It
-     *    scans 360° without any random roll, continuously picking the next closest
-     *    block to harvest or plant. The state expires after a timer or when there
-     *    is nothing left to do nearby.
+     * States:
+     * 1. **Walking** — an action is in progress (walking to a block). Continue it.
+     * 2. **Cooldown** — the villager just finished a farming session and is resting.
+     *    Tick down the cooldown; do nothing else.
+     * 3. **Farming** — the villager is actively working an area. Scan 360° for the
+     *    next block to harvest/plant. If nothing left → exit + start cooldown.
+     * 4. **Idle** — the villager is wandering. Every ~10 s on average (random roll)
+     *    it glances at its forward cone. If it spots work → enter farming state.
      */
     private static void performFarmerActions(VillagerEntity villager, ServerWorld world, VillagerAgentData agent) {
+        // ── 1. Walking to a target block — continue the action ──
         VillagerAction current = agent.getCurrentAction();
-
-        // If we already have an active walk-to-block action, continue it
         if (current != null && isFarmingAction(current)) {
             continueFarmingAction(villager, world, agent, current);
             return;
         }
 
-        // --- Already in farming state: scan 360° for the next block to work ---
-        if (agent.isInFarmingState()) {
-            agent.tickFarmingState();
+        // ── 2. Cooldown after a farming session ──
+        if (agent.isOnFarmingCooldown()) {
+            agent.tickFarmingCooldown();
+            return; // resting — do nothing
+        }
 
+        // ── 3. In farming state — scan 360° for the next reachable block ──
+        if (agent.isInFarmingState()) {
             BlockPos villagerPos = villager.blockPosition();
 
-            // Priority 1: harvest
-            BlockPos cropTarget = FarmingAction.findNearestMatureCrop(world, villagerPos);
+            // Priority 1: harvest mature crops (try nearest reachable)
+            BlockPos cropTarget = findFirstReachable(villager,
+                    FarmingAction.findMatureCropsSorted(world, villagerPos));
             if (cropTarget != null) {
                 startFarmingAction(villager, agent, VillagerAction.ActionType.HARVEST,
                         "Harvesting area", cropTarget);
                 return;
             }
 
-            // Priority 2: plant
+            // Priority 2: plant seeds on empty farmland
             if (FarmingAction.hasSeeds(agent)) {
-                BlockPos farmlandTarget = FarmingAction.findNearestEmptyFarmland(world, villagerPos);
+                BlockPos farmlandTarget = findFirstReachable(villager,
+                        FarmingAction.findEmptyFarmlandSorted(world, villagerPos));
                 if (farmlandTarget != null) {
                     startFarmingAction(villager, agent, VillagerAction.ActionType.GROW,
                             "Planting area", farmlandTarget);
@@ -180,16 +185,14 @@ public class VillagerAgentManager {
                 }
             }
 
-            // Nothing left to do — exit farming state early
-            agent.setFarmingStateTicksRemaining(0);
-            agent.setCurrentActivity("idle");
-            LOGGER.debug(agent.getName() + " finished farming — nothing left nearby");
+            // Nothing reachable — exit farming state, start cooldown
+            exitFarmingState(agent);
             return;
         }
 
-        // --- Not in farming state: random chance + forward cone to notice work ---
-        if (RANDOM.nextDouble() > FARMING_ACTION_CHANCE) {
-            return; // Not looking this tick
+        // ── 4. Idle — random chance to glance at forward cone ──
+        if (RANDOM.nextDouble() > FARMING_SCAN_CHANCE) {
+            return; // not looking this tick
         }
 
         BlockPos villagerPos = villager.blockPosition();
@@ -215,15 +218,36 @@ public class VillagerAgentManager {
         }
     }
 
-    /**
-     * Put the villager into farming state for a random duration.
-     */
+    /** Enter farming state — the villager commits to working the area. */
     private static void enterFarmingState(VillagerAgentData agent) {
-        int duration = FARMING_STATE_MIN_TICKS
-                + RANDOM.nextInt(FARMING_STATE_MAX_TICKS - FARMING_STATE_MIN_TICKS + 1);
-        agent.setFarmingStateTicksRemaining(duration);
+        agent.setInFarmingState(true);
         agent.setCurrentActivity("farming");
-        LOGGER.debug(agent.getName() + " entered farming state for " + duration + " ticks");
+        LOGGER.debug(agent.getName() + " entered farming state");
+    }
+
+    /** Exit farming state and start a cooldown before the next scan cycle. */
+    private static void exitFarmingState(VillagerAgentData agent) {
+        agent.setInFarmingState(false);
+        int cooldown = FARMING_COOLDOWN_MIN_TICKS
+                + RANDOM.nextInt(FARMING_COOLDOWN_MAX_TICKS - FARMING_COOLDOWN_MIN_TICKS + 1);
+        agent.setFarmingCooldownTicks(cooldown);
+        agent.setCurrentActivity("idle");
+        LOGGER.debug(agent.getName() + " finished farming — cooldown " + cooldown + " ticks");
+    }
+
+    /**
+     * Given a list of candidate BlockPos (sorted nearest-first), return the first
+     * one the villager can actually path to, or null if none are reachable.
+     * Uses Minecraft's built-in A* pathfinder — cheap for short distances.
+     */
+    private static BlockPos findFirstReachable(VillagerEntity villager, List<BlockPos> candidates) {
+        for (BlockPos pos : candidates) {
+            Path path = villager.getNavigation().createPath(pos, 1);
+            if (path != null) {
+                return pos;
+            }
+        }
+        return null;
     }
 
     private static boolean isFarmingAction(VillagerAction action) {

@@ -35,7 +35,8 @@ public class VillagerAgentData {
     private boolean llmGenerationFailed = false;
     private String llmErrorMessage = null;
     private long lastRestockTime = 0;  // Track when villager last restocked at job block
-    private int farmingStateTicksRemaining = 0;  // >0 means the villager is actively farming an area
+    private boolean inFarmingState = false;       // true while the villager is actively farming an area
+    private int farmingCooldownTicks = 0;          // >0 means the villager is resting after a farming session
 
     public VillagerAgentData(UUID villagerId) {
         this.villagerId = villagerId;
@@ -249,10 +250,12 @@ public class VillagerAgentData {
     public String getLLMErrorMessage() { return llmErrorMessage; }
     public long getLastRestockTime() { return lastRestockTime; }
     public void setLastRestockTime(long time) { this.lastRestockTime = time; }
-    public int getFarmingStateTicksRemaining() { return farmingStateTicksRemaining; }
-    public void setFarmingStateTicksRemaining(int ticks) { this.farmingStateTicksRemaining = ticks; }
-    public boolean isInFarmingState() { return farmingStateTicksRemaining > 0; }
-    public void tickFarmingState() { if (farmingStateTicksRemaining > 0) farmingStateTicksRemaining--; }
+    public boolean isInFarmingState() { return inFarmingState; }
+    public void setInFarmingState(boolean farming) { this.inFarmingState = farming; }
+    public int getFarmingCooldownTicks() { return farmingCooldownTicks; }
+    public void setFarmingCooldownTicks(int ticks) { this.farmingCooldownTicks = ticks; }
+    public boolean isOnFarmingCooldown() { return farmingCooldownTicks > 0; }
+    public void tickFarmingCooldown() { if (farmingCooldownTicks > 0) farmingCooldownTicks--; }
     
     public void addMemory(String memory) {
         memories.add(memory);
