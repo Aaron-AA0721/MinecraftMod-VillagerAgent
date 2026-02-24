@@ -102,7 +102,7 @@ public class JobStarterItems {
         List<StarterItem> items = getStarterItems(agent.getProfession());
 
         for (StarterItem starterItem : items) {
-            // Get the max stack size for this item
+            // Create a temporary ItemStack to get the actual max stack size for this item
             int maxStackSize = starterItem.quantity;
 
             // Count how many of this item the villager already has

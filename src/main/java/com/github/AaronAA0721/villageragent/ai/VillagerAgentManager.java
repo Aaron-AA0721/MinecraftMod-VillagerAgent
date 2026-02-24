@@ -22,10 +22,18 @@ public class VillagerAgentManager {
     private static final Random RANDOM = new Random();
 
     /**
-     * Chance per tick that an idle villager glances around for farming work.
-     * 1/200 = 0.005 → on average once every 200 ticks ≈ 10 seconds.
+     * Chance per tick that an idle farmer glances around for farming work.
+     * Farming ticks run every tick (not gated by AGENT_THINK_INTERVAL),
+     * so 1/200 ≈ once every 10 seconds on average.
      */
     private static final double FARMING_SCAN_CHANCE = 0.005;
+
+    /**
+     * How often (in ticks) the farming state machine runs for active farmers.
+     * Walking/acting checks run on this interval for responsiveness.
+     * Idle scanning uses its own random chance per tick.
+     */
+    private static final int FARMING_TICK_INTERVAL = 3;
 
     /**
      * Cooldown (in ticks) after the villager finishes a farming session before
@@ -71,17 +79,17 @@ public class VillagerAgentManager {
     }
     
     /**
-     * Update all agents in the world
+     * Update all agents in the world (slow tick — goals, restocking, etc.)
      */
     public static void tickAgents(World world) {
         if (!ModConfig.ENABLE_AI_AGENTS.get()) return;
-        
+
         long currentTime = world.getGameTime();
         int thinkInterval = ModConfig.AGENT_THINK_INTERVAL.get();
-        
+
         for (Map.Entry<UUID, VillagerAgentData> entry : agents.entrySet()) {
             VillagerAgentData agent = entry.getValue();
-            
+
             // Only update periodically to avoid performance issues
             if (currentTime - agent.getLastThinkTime() >= thinkInterval) {
                 agent.setLastThinkTime(currentTime);
@@ -89,9 +97,46 @@ public class VillagerAgentManager {
             }
         }
     }
-    
+
     /**
-     * Update a single agent's AI
+     * Fast tick for farming — runs every tick so walking/acting is responsive.
+     * Separated from the slow AI think loop to avoid 100-tick delays between
+     * walk checks and action execution.
+     */
+    public static void tickFarming(World world) {
+        if (!ModConfig.ENABLE_AI_AGENTS.get()) return;
+        if (!ModConfig.ENABLE_WORLD_INTERACTION.get()) return;
+        if (!(world instanceof ServerWorld)) return;
+
+        long currentTime = world.getGameTime();
+        ServerWorld serverWorld = (ServerWorld) world;
+
+        for (VillagerAgentData agent : agents.values()) {
+            String profession = agent.getProfession();
+            if (profession == null || !profession.equalsIgnoreCase("farmer")) continue;
+
+            // Active farming (walking/acting) runs every FARMING_TICK_INTERVAL ticks
+            // Idle scanning runs every tick but with a low random chance
+            boolean hasActiveAction = agent.getCurrentAction() != null && isFarmingAction(agent.getCurrentAction());
+            boolean inFarmingState = agent.isInFarmingState();
+            boolean onCooldown = agent.isOnFarmingCooldown();
+
+            if (hasActiveAction || inFarmingState || onCooldown) {
+                // Active farming — run every few ticks for responsiveness
+                if (currentTime % FARMING_TICK_INTERVAL != 0) continue;
+            }
+            // else: idle — runs every tick, gated by FARMING_SCAN_CHANCE inside performFarmerActions
+
+            VillagerEntity villager = findVillagerEntity(world, agent.getVillagerId());
+            if (villager == null) continue;
+
+            performFarmerActions(villager, serverWorld, agent);
+        }
+    }
+
+    /**
+     * Update a single agent's AI (slow tick — goals, restocking, etc.)
+     * Farming is handled separately by tickFarming().
      */
     private static void updateAgent(World world, VillagerAgentData agent) {
         // Find the actual villager entity
@@ -103,11 +148,6 @@ public class VillagerAgentManager {
         // Check if villager is at their job block for restocking
         checkJobBlockRestock(villager, agent);
 
-        // For farmers: automatically perform farming actions based on surroundings
-        if (world instanceof ServerWorld) {
-            performProfessionActions(villager, (ServerWorld) world, agent);
-        }
-
         // Process current goals
         processGoals(villager, agent);
 
@@ -118,25 +158,7 @@ public class VillagerAgentManager {
     }
 
     /**
-     * Perform automatic profession-based actions.
-     * Farmers will harvest mature crops and plant seeds when near farmland.
-     */
-    private static void performProfessionActions(VillagerEntity villager, ServerWorld world, VillagerAgentData agent) {
-        if (!ModConfig.ENABLE_WORLD_INTERACTION.get()) return;
-
-        String profession = agent.getProfession();
-        if (profession == null) return;
-
-        switch (profession.toLowerCase()) {
-            case "farmer":
-                performFarmerActions(villager, world, agent);
-                break;
-            // Future professions can be added here
-        }
-    }
-
-    /**
-     * Farmer-specific automatic actions — state machine per tick.
+     * Farmer-specific automatic actions — state machine that runs every few ticks.
      *
      * States:
      * 1. **Walking** — an action is in progress (walking to a block). Continue it.
@@ -157,7 +179,7 @@ public class VillagerAgentManager {
 
         // ── 2. Cooldown after a farming session ──
         if (agent.isOnFarmingCooldown()) {
-            agent.tickFarmingCooldown();
+            agent.tickFarmingCooldown(FARMING_TICK_INTERVAL);
             return; // resting — do nothing
         }
 
@@ -279,12 +301,17 @@ public class VillagerAgentManager {
 
     /**
      * Continue an in-progress farming action: check distance, act or keep walking.
+     *
+     * Vanilla villager brain activities (WORK, IDLE, MEET, etc.) continuously
+     * issue their own navigation commands that override ours.  To prevent the
+     * villager from wandering away mid-farm we:
+     *   1. Stop the current vanilla navigation path every call.
+     *   2. Re-issue our own moveTo every call (every FARMING_TICK_INTERVAL ticks).
      */
     private static void continueFarmingAction(VillagerEntity villager, ServerWorld world,
                                                VillagerAgentData agent, VillagerAction action) {
         BlockPos target = action.getTargetBlockPos();
         if (target == null) {
-            // Shouldn't happen, but clear the action
             agent.setCurrentAction(null);
             return;
         }
@@ -292,11 +319,10 @@ public class VillagerAgentManager {
         BlockPos villagerPos = villager.blockPosition();
         double distSq = villagerPos.distSqr(target);
 
-        // Check if we've arrived (within 2 blocks)
+        // Check if we've arrived (within 1 block)
         if (distSq <= FarmingAction.INTERACT_RANGE_SQ) {
             action.setPhase(VillagerAction.ActionPhase.ACTING);
             performFarmingActionAtBlock(villager, world, agent, action, target);
-            // Action done — clear it so next tick we scan for a new target
             agent.setCurrentAction(null);
             return;
         }
@@ -306,18 +332,18 @@ public class VillagerAgentManager {
         if (action.getStuckTicks() > FarmingAction.STUCK_TIMEOUT_TICKS) {
             LOGGER.debug(agent.getName() + " gave up reaching " + target + " (stuck)");
             agent.setCurrentAction(null);
-            // Don't exit farming state — next tick will pick a different block
             if (!agent.isInFarmingState()) {
                 agent.setCurrentActivity("idle");
             }
             return;
         }
 
-        // Re-issue navigation command periodically (every 20 ticks) in case path was interrupted
-        if (action.getStuckTicks() % 20 == 0) {
-            villager.getNavigation().moveTo(
-                    target.getX() + 0.5, target.getY(), target.getZ() + 0.5, 0.6);
-        }
+        // Cancel whatever vanilla AI decided to do, then re-assert our path.
+        // This runs every FARMING_TICK_INTERVAL (3) ticks — fast enough to
+        // override vanilla brain tasks without visible jitter.
+        villager.getNavigation().stop();
+        villager.getNavigation().moveTo(
+                target.getX() + 0.5, target.getY(), target.getZ() + 0.5, 0.6);
     }
 
     /**
@@ -330,18 +356,20 @@ public class VillagerAgentManager {
             case HARVEST:
                 // Verify the crop is still there and mature
                 if (FarmingAction.isMatureCrop(world, target)) {
-                    FarmingAction.harvestBlockAt(villager, world, agent, target);
-                    // After harvesting, try to replant immediately if we have seeds
-                    if (FarmingAction.isEmptyFarmland(world, target.below())) {
-                        FarmingAction.plantSeedAt(villager, world, agent, target.below());
+                    // Remember which crop was here before harvesting
+                    net.minecraft.block.Block harvestedCrop = FarmingAction.harvestBlockAt(villager, world, agent, target);
+                    // After harvesting, replant the same crop type
+                    if (harvestedCrop != null && FarmingAction.isEmptyFarmland(world, target.below())) {
+                        FarmingAction.plantSpecificCropAt(villager, world, agent, target.below(), harvestedCrop);
                     }
                 } else {
                     LOGGER.debug(agent.getName() + " arrived but crop at " + target + " is gone");
                 }
                 break;
             case GROW:
+                // Plant on empty farmland: prefer same crop as adjacent blocks, else random
                 if (FarmingAction.isEmptyFarmland(world, target)) {
-                    FarmingAction.plantSeedAt(villager, world, agent, target);
+                    FarmingAction.plantSmartAt(villager, world, agent, target);
                 } else {
                     LOGGER.debug(agent.getName() + " arrived but farmland at " + target + " is occupied");
                 }

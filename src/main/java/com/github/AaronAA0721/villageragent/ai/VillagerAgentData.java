@@ -18,11 +18,33 @@ import java.util.concurrent.TimeUnit;
 public class VillagerAgentData {
     private static final Logger LOGGER = LogManager.getLogger();
 
+    /** One Minecraft day = 24 000 ticks.  Conversations older than this are forgotten. */
+    private static final long CONVERSATION_EXPIRY_TICKS = 24_000L;
+
+    /** Maximum number of conversation entries kept (safety cap). */
+    private static final int MAX_CONVERSATION_ENTRIES = 40;
+
+    // ── Inner class: a single chat line with its game-time stamp ──
+    public static class TimestampedMessage {
+        private final String text;
+        private final long gameTick;
+
+        public TimestampedMessage(String text, long gameTick) {
+            this.text = text;
+            this.gameTick = gameTick;
+        }
+
+        public String getText()    { return text; }
+        public long   getGameTick() { return gameTick; }
+
+        @Override public String toString() { return text; }
+    }
+
     private UUID villagerId;
     private String name;
     private String profession;  // The villager's actual Minecraft profession (Farmer, Librarian, etc.)
     private String personality;
-    private List<String> conversationHistory;
+    private List<TimestampedMessage> conversationHistory;
     private List<String> memories;
     private Map<String, Integer> relationships; // villager UUID -> relationship score
     private List<AgentGoal> goals;
@@ -230,7 +252,7 @@ public class VillagerAgentData {
     public void setName(String name) { this.name = name; }
     public String getPersonality() { return personality; }
     public void setPersonality(String personality) { this.personality = personality; }
-    public List<String> getConversationHistory() { return conversationHistory; }
+    public List<TimestampedMessage> getConversationHistory() { return conversationHistory; }
     public List<String> getMemories() { return memories; }
     public Map<String, Integer> getRelationships() { return relationships; }
     public List<AgentGoal> getGoals() { return goals; }
@@ -256,6 +278,7 @@ public class VillagerAgentData {
     public void setFarmingCooldownTicks(int ticks) { this.farmingCooldownTicks = ticks; }
     public boolean isOnFarmingCooldown() { return farmingCooldownTicks > 0; }
     public void tickFarmingCooldown() { if (farmingCooldownTicks > 0) farmingCooldownTicks--; }
+    public void tickFarmingCooldown(int ticks) { farmingCooldownTicks = Math.max(0, farmingCooldownTicks - ticks); }
     
     public void addMemory(String memory) {
         memories.add(memory);
@@ -264,9 +287,23 @@ public class VillagerAgentData {
         }
     }
     
-    public void addConversation(String conversation) {
-        conversationHistory.add(conversation);
-        if (conversationHistory.size() > 20) {
+    /**
+     * Record a conversation line with the current game tick.
+     * Entries older than 1 Minecraft day (24 000 ticks) are pruned automatically.
+     */
+    public void addConversation(String conversation, long gameTick) {
+        conversationHistory.add(new TimestampedMessage(conversation, gameTick));
+        pruneExpiredConversations(gameTick);
+    }
+
+    /**
+     * Remove conversation entries older than {@link #CONVERSATION_EXPIRY_TICKS}
+     * and enforce the hard cap {@link #MAX_CONVERSATION_ENTRIES}.
+     */
+    public void pruneExpiredConversations(long currentTick) {
+        conversationHistory.removeIf(msg ->
+                currentTick - msg.getGameTick() > CONVERSATION_EXPIRY_TICKS);
+        while (conversationHistory.size() > MAX_CONVERSATION_ENTRIES) {
             conversationHistory.remove(0);
         }
     }
@@ -338,42 +375,66 @@ public class VillagerAgentData {
     }
 
     /**
-     * Generate a chat response using LLM
-     * @param playerName The name of the player talking to the villager
+     * Generate a chat response using LLM.
+     * Includes the full recent conversation history (within 1 game-day) so the
+     * villager can reference earlier exchanges when replying.
+     *
+     * @param playerName    The name of the player talking to the villager
      * @param playerMessage The message from the player (null for greeting)
+     * @param gameTick      The current world game tick (used for timestamping)
      * @return CompletableFuture with the villager's response
      */
-    public CompletableFuture<String> generateChatResponse(String playerName, String playerMessage) {
+    public CompletableFuture<String> generateChatResponse(String playerName, String playerMessage, long gameTick) {
+        // Prune stale entries before building the prompt
+        pruneExpiredConversations(gameTick);
+
+        // ── System prompt ──
         String systemPrompt = "You are " + name + ", a " + profession + " in a medieval Minecraft village. " +
                 "Your job/profession is: " + profession + ". " +
                 "Your personality: " + personality + ". " +
                 "Respond in character as this villager. Keep responses short (1-2 sentences). " +
                 "Be friendly but stay in character. Don't break the fourth wall. " +
                 "Your responses should reflect your profession - for example, a Farmer talks about crops, " +
-                "a Librarian about books, a Blacksmith about tools and armor.";
+                "a Librarian about books, a Blacksmith about tools and armor. " +
+                "You remember conversations from today. If the player refers to something said earlier, " +
+                "use the conversation history below to give a consistent, contextual reply.";
 
-        // Build context from recent memories
+        // ── Build user prompt with context ──
         StringBuilder context = new StringBuilder();
+
+        // Recent memories (non-conversation observations)
         if (!memories.isEmpty()) {
             context.append("Recent memories: ");
-            int start = Math.max(0, memories.size() - 3);
+            int start = Math.max(0, memories.size() - 5);
             for (int i = start; i < memories.size(); i++) {
                 context.append(memories.get(i)).append(". ");
             }
+            context.append("\n");
+        }
+
+        // Conversation history from today
+        if (!conversationHistory.isEmpty()) {
+            context.append("Conversation history from today:\n");
+            for (TimestampedMessage msg : conversationHistory) {
+                context.append("- ").append(msg.getText()).append("\n");
+            }
+            context.append("\n");
         }
 
         String userPrompt;
         if (playerMessage == null || playerMessage.isEmpty()) {
             userPrompt = context + "A player named " + playerName + " approaches you. Greet them as a " + profession + ".";
         } else {
-            userPrompt = context + "Player " + playerName + " says: \"" + playerMessage + "\". Respond in character as a " + profession + ".";
+            userPrompt = context + "Now, player " + playerName + " says: \"" + playerMessage + "\". " +
+                    "Respond in character. You may reference earlier parts of the conversation if relevant.";
         }
 
+        final long tick = gameTick; // capture for lambda
         return LLMService.queryLLM(systemPrompt, userPrompt)
                 .thenApply(response -> {
-                    // Store the conversation
-                    addConversation(playerName + ": " + (playerMessage != null ? playerMessage : "[greeting]"));
-                    addConversation(name + ": " + response);
+                    // Store both sides of the exchange with the current game tick
+                    addConversation(playerName + ": " + (playerMessage != null ? playerMessage : "[greeting]"), tick);
+                    addConversation(name + ": " + response, tick);
                     return response;
                 })
                 .exceptionally(e -> {
@@ -402,11 +463,12 @@ public class VillagerAgentData {
         }
         nbt.put("Memories", memoriesNBT);
 
-        // Save conversation history
+        // Save conversation history (with timestamps)
         ListNBT conversationsNBT = new ListNBT();
-        for (String conv : conversationHistory) {
+        for (TimestampedMessage msg : conversationHistory) {
             CompoundNBT convNBT = new CompoundNBT();
-            convNBT.putString("Conversation", conv);
+            convNBT.putString("Text", msg.getText());
+            convNBT.putLong("Tick", msg.getGameTick());
             conversationsNBT.add(convNBT);
         }
         nbt.put("Conversations", conversationsNBT);
@@ -434,12 +496,21 @@ public class VillagerAgentData {
             memories.add(memNBT.getString("Memory"));
         }
 
-        // Load conversations
+        // Load conversations (supports both old plain-string and new timestamped format)
         ListNBT conversationsNBT = nbt.getList("Conversations", 10);
         conversationHistory.clear();
         for (int i = 0; i < conversationsNBT.size(); i++) {
             CompoundNBT convNBT = conversationsNBT.getCompound(i);
-            conversationHistory.add(convNBT.getString("Conversation"));
+            if (convNBT.contains("Text")) {
+                // New timestamped format
+                conversationHistory.add(new TimestampedMessage(
+                        convNBT.getString("Text"),
+                        convNBT.getLong("Tick")));
+            } else if (convNBT.contains("Conversation")) {
+                // Legacy format — assign tick 0 (will be pruned on first access)
+                conversationHistory.add(new TimestampedMessage(
+                        convNBT.getString("Conversation"), 0L));
+            }
         }
 
         // Load inventory

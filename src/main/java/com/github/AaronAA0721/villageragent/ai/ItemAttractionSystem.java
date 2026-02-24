@@ -16,8 +16,8 @@ import java.util.List;
  */
 public class ItemAttractionSystem {
     private static final Logger LOGGER = LogManager.getLogger();
-    private static final double PICKUP_RANGE = 8.0; // blocks - same as player pickup range
-    private static final double ATTRACTION_RANGE = 16.0; // blocks - items start moving towards villager
+    private static final double PICKUP_RANGE = 1.0; // blocks - pick up only when right next to the item
+    private static final double ATTRACTION_RANGE = 2.0; // blocks - gently pull nearby items closer
     
     /**
      * Process item attraction and pickup for a villager

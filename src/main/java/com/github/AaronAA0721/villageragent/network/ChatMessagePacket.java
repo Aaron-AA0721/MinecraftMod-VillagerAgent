@@ -49,8 +49,9 @@ public class ChatMessagePacket {
             String playerName = player.getName().getString();
             LOGGER.info("Chat from " + playerName + " to " + agent.getName() + ": " + packet.message);
             
-            // Generate LLM response asynchronously
-            agent.generateChatResponse(playerName, packet.message).thenAccept(response -> {
+            // Generate LLM response asynchronously (pass game tick for conversation memory)
+            long gameTick = player.level.getGameTime();
+            agent.generateChatResponse(playerName, packet.message, gameTick).thenAccept(response -> {
                 // Send response back to client
                 VillagerResponsePacket responsePacket = new VillagerResponsePacket(
                         packet.villagerId,

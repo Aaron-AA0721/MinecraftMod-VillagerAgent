@@ -1,13 +1,11 @@
 package com.github.AaronAA0721.villageragent.ai;
 
 import net.minecraft.block.*;
-import net.minecraft.entity.item.ItemEntity;
 import net.minecraft.entity.merchant.villager.VillagerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.state.IntegerProperty;
-import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.server.ServerWorld;
 import org.apache.logging.log4j.LogManager;
@@ -21,8 +19,8 @@ import java.util.*;
  * Uses a walk-then-act pattern:
  * 1. Scan for a target block within sight range
  * 2. Walk toward it using the villager's navigation
- * 3. When within reach (2 blocks), perform the action on that single block
- * 4. Repeat
+ * 3. When within reach (1 block), perform the action on that single block
+ * 4. Repeat — dropped items are picked up by the general item attraction system
  */
 public class FarmingAction {
     private static final Logger LOGGER = LogManager.getLogger();
@@ -31,11 +29,13 @@ public class FarmingAction {
     public static final int SCAN_RADIUS = 5;
     private static final int SCAN_HEIGHT = 2;
 
-    /** The villager must be within this distance (squared) to interact with a block. */
-    public static final double INTERACT_RANGE_SQ = 4.0; // 2 blocks squared
+    /** The villager must be within this distance (squared) to interact with a block.
+     *  2.0 = 1 block away in any horizontal direction (including diagonal). */
+    public static final double INTERACT_RANGE_SQ = 2.0;
 
-    /** If the villager hasn't reached its target in this many ticks, give up. */
-    public static final int STUCK_TIMEOUT_TICKS = 100; // ~5 seconds
+    /** If the villager hasn't reached its target in this many checks, give up.
+     *  At FARMING_TICK_INTERVAL=3, 100 checks ≈ 300 ticks ≈ 15 seconds. */
+    public static final int STUCK_TIMEOUT_TICKS = 100;
 
     /**
      * Minimum dot-product between the villager's look direction and the direction
@@ -46,16 +46,25 @@ public class FarmingAction {
 
     // Map of seed items to the crop blocks they plant
     private static final Map<Item, Block> SEED_TO_CROP = new LinkedHashMap<>();
+    // Reverse map: crop block → seed item
+    private static final Map<Block, Item> CROP_TO_SEED = new HashMap<>();
     // Map of crop blocks to their max age property
     private static final Map<Block, IntegerProperty> CROP_AGE_PROPERTIES = new HashMap<>();
     // Map of crop blocks to their max age value
     private static final Map<Block, Integer> CROP_MAX_AGE = new HashMap<>();
+
+    private static final Random RANDOM = new Random();
 
     static {
         SEED_TO_CROP.put(Items.WHEAT_SEEDS, Blocks.WHEAT);
         SEED_TO_CROP.put(Items.CARROT, Blocks.CARROTS);
         SEED_TO_CROP.put(Items.POTATO, Blocks.POTATOES);
         SEED_TO_CROP.put(Items.BEETROOT_SEEDS, Blocks.BEETROOTS);
+
+        // Build reverse map
+        for (Map.Entry<Item, Block> entry : SEED_TO_CROP.entrySet()) {
+            CROP_TO_SEED.put(entry.getValue(), entry.getKey());
+        }
 
         CROP_AGE_PROPERTIES.put(Blocks.WHEAT, CropsBlock.AGE);
         CROP_AGE_PROPERTIES.put(Blocks.CARROTS, CropsBlock.AGE);
@@ -237,27 +246,25 @@ public class FarmingAction {
     /**
      * Harvest ONE mature crop at the given position.
      * Breaks the block and collects dropped items into the agent's inventory.
-     * @return true if the block was harvested
+     * @return the crop Block that was harvested, or null if nothing was harvested
      */
-    public static boolean harvestBlockAt(VillagerEntity villager, ServerWorld world,
+    public static Block harvestBlockAt(VillagerEntity villager, ServerWorld world,
                                           VillagerAgentData agent, BlockPos cropPos) {
         BlockState state = world.getBlockState(cropPos);
         Block block = state.getBlock();
 
         if (!CROP_AGE_PROPERTIES.containsKey(block)) {
             LOGGER.debug("Block at " + cropPos + " is not a crop, skipping harvest");
-            return false;
+            return null;
         }
 
-        // Break the crop — drops items into the world
+        // Break the crop — drops items into the world.
+        // Items will be picked up by the general item attraction system.
         world.destroyBlock(cropPos, true);
-
-        // Pick up dropped items near the broken block
-        collectDroppedItems(villager, world, agent, cropPos);
 
         agent.addMemory("Harvested " + block.getRegistryName() + " at " + cropPos);
         LOGGER.info(agent.getName() + " harvested " + block.getRegistryName() + " at " + cropPos);
-        return true;
+        return block;
     }
 
     /**
@@ -298,6 +305,97 @@ public class FarmingAction {
     }
 
     /**
+     * Plant a specific crop type on the farmland block at the given position.
+     * Falls back to any available seed if the villager doesn't have the requested one.
+     * @param cropBlock the desired crop block to plant (e.g. Blocks.WHEAT), or null for any
+     * @return true if a seed was planted
+     */
+    public static boolean plantSpecificCropAt(VillagerEntity villager, ServerWorld world,
+                                               VillagerAgentData agent, BlockPos farmlandPos,
+                                               Block cropBlock) {
+        BlockPos plantPos = farmlandPos.above();
+
+        // Validate the spot is still valid
+        if (!world.getBlockState(plantPos).isAir(world, plantPos)) return false;
+        if (!(world.getBlockState(farmlandPos).getBlock() instanceof FarmlandBlock)) return false;
+
+        // Try the requested crop type first
+        if (cropBlock != null) {
+            Item seedItem = CROP_TO_SEED.get(cropBlock);
+            if (seedItem != null) {
+                ItemStack seedStack = new ItemStack(seedItem);
+                if (agent.getInventory().countItem(seedStack) > 0) {
+                    world.setBlock(plantPos, cropBlock.defaultBlockState(), 3);
+                    agent.getInventory().removeItem(seedStack, 1);
+                    agent.addMemory("Planted " + seedItem.getRegistryName() + " at " + plantPos);
+                    LOGGER.info(agent.getName() + " planted " + seedItem.getRegistryName() + " at " + plantPos);
+                    return true;
+                }
+            }
+        }
+
+        // Fallback: plant any seed the villager has
+        return plantSeedAt(villager, world, agent, farmlandPos);
+    }
+
+    /**
+     * Find the crop type growing on an adjacent farmland block (N/S/E/W neighbors).
+     * Checks the block above each neighboring farmland for a known crop.
+     * @param farmlandPos the farmland position to check neighbors of
+     * @return the crop Block found adjacent, or null if none
+     */
+    public static Block findAdjacentCropType(ServerWorld world, BlockPos farmlandPos) {
+        BlockPos[] neighbors = {
+            farmlandPos.north(), farmlandPos.south(),
+            farmlandPos.east(), farmlandPos.west()
+        };
+
+        for (BlockPos neighbor : neighbors) {
+            // Crops sit above farmland
+            BlockPos cropPos = neighbor.above();
+            BlockState state = world.getBlockState(cropPos);
+            Block block = state.getBlock();
+            if (CROP_TO_SEED.containsKey(block)) {
+                return block;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Smart planting: plant on empty farmland, preferring the same crop as adjacent blocks.
+     * If no adjacent crop is found, plant a random crop the villager has seeds for.
+     * @return true if a seed was planted
+     */
+    public static boolean plantSmartAt(VillagerEntity villager, ServerWorld world,
+                                        VillagerAgentData agent, BlockPos farmlandPos) {
+        // Check what crop is growing next to this farmland
+        Block adjacentCrop = findAdjacentCropType(world, farmlandPos);
+
+        if (adjacentCrop != null) {
+            // Try to plant the same crop; falls back to any seed if unavailable
+            return plantSpecificCropAt(villager, world, agent, farmlandPos, adjacentCrop);
+        }
+
+        // No adjacent crop — pick a random seed type the villager has
+        List<Item> availableSeeds = new ArrayList<>();
+        for (Item seedItem : SEED_TO_CROP.keySet()) {
+            if (agent.getInventory().countItem(new ItemStack(seedItem)) > 0) {
+                availableSeeds.add(seedItem);
+            }
+        }
+
+        if (availableSeeds.isEmpty()) {
+            LOGGER.debug(agent.getName() + " has no seeds to plant");
+            return false;
+        }
+
+        Item chosenSeed = availableSeeds.get(RANDOM.nextInt(availableSeeds.size()));
+        Block cropBlock = SEED_TO_CROP.get(chosenSeed);
+        return plantSpecificCropAt(villager, world, agent, farmlandPos, cropBlock);
+    }
+
+    /**
      * Check whether the villager has any plantable seeds in inventory.
      */
     public static boolean hasSeeds(VillagerAgentData agent) {
@@ -312,27 +410,5 @@ public class FarmingAction {
     // ---------------------------------------------------------------
     //  Helpers
     // ---------------------------------------------------------------
-
-    /**
-     * Collect dropped ItemEntities near a position into the villager's inventory.
-     */
-    private static void collectDroppedItems(VillagerEntity villager, ServerWorld world,
-                                             VillagerAgentData agent, BlockPos pos) {
-        AxisAlignedBB pickupBox = new AxisAlignedBB(pos).inflate(2.0);
-        List<ItemEntity> droppedItems = world.getEntitiesOfClass(ItemEntity.class, pickupBox);
-
-        for (ItemEntity itemEntity : droppedItems) {
-            if (!itemEntity.isAlive()) continue;
-
-            ItemStack stack = itemEntity.getItem().copy();
-            boolean added = agent.getInventory().addItem(stack);
-
-            if (added) {
-                itemEntity.remove();
-                LOGGER.debug(agent.getName() + " picked up " + stack.getCount() + "x " +
-                        stack.getItem().getRegistryName());
-            }
-        }
-    }
 }
 

@@ -47,7 +47,13 @@ public class VillagerEventHandler {
                 VillagerAgentData agent = VillagerAgentManager.getOrCreateAgent(villager);
                 // Update profession from the actual villager entity
                 updateVillagerProfession(villager, agent);
-                LOGGER.info("AI Agent created for villager: " + villager.getUUID() + " (" + agent.getProfession() + ")");
+
+                // Display the agent's name above the villager's head
+                villager.setCustomName(new StringTextComponent(agent.getName()));
+                villager.setCustomNameVisible(true);
+
+                LOGGER.info("AI Agent created for villager: " + villager.getUUID()
+                        + " (" + agent.getName() + ", " + agent.getProfession() + ")");
             }
         }
     }
@@ -115,7 +121,11 @@ public class VillagerEventHandler {
         if (!ModConfig.ENABLE_AI_AGENTS.get()) return;
 
         if (event.phase == TickEvent.Phase.END && !event.world.isClientSide) {
+            // Slow tick — goals, restocking, AI decisions (gated by AGENT_THINK_INTERVAL)
             VillagerAgentManager.tickAgents(event.world);
+
+            // Fast tick — farming state machine runs every tick for responsive walking/acting
+            VillagerAgentManager.tickFarming(event.world);
 
             // Handle item pickup for all villagers using configurable interval
             pickupTickCounter++;
